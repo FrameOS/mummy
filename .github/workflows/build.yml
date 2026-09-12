@@ -29,4 +29,9 @@ jobs:
       if: ${{ runner.os == 'Linux' }}
     - run: nim c -r -d:useMalloc -d:ssl tests/test_tls.nim
       if: ${{ runner.os == 'Linux' }}
+    # The fuzzer creates a few thousand servers in seconds. On Windows every
+    # SelectEvent is a loopback socket pair, so the dynamic port range runs
+    # out part-way through and newServer raises (upstream's Windows job flakes
+    # the same way); Linux is where the fuzzer is meaningful.
     - run: nim c -r -d:useMalloc -d:mummyNoWorkers tests/fuzz_recv.nim
+      if: ${{ runner.os == 'Linux' }}

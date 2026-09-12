@@ -1412,18 +1412,15 @@ proc destroy(server: Server, joinThreads: bool) {.raises: [].} =
     deinitLock(server.sendQueueLock)
     deinitLock(server.websocketQueuesLock)
     deinitLock(server.listenerOpsLock)
-    try:
-      server.responseQueued.close()
-    except Exception as e:
-      discard # Ignore
-    try:
-      server.sendQueued.close()
-    except Exception as e:
-      discard # Ignore
-    try:
-      server.shutdown.close()
-    except Exception as e:
-      discard # Ignore
+    # newServer can fail between creating these (on Windows each is a
+    # loopback socket pair, and a busy process can run out of ephemeral
+    # ports); closing an event that was never created is a nil dereference.
+    for event in [server.responseQueued, server.sendQueued, server.shutdown]:
+      if event != nil:
+        try:
+          event.close()
+        except Exception as e:
+          discard # Ignore
     `=destroy`(server[])
     deallocShared(server)
   else:
