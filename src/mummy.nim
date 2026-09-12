@@ -104,27 +104,25 @@ type
     message: Message
   ) {.gcsafe.}
 
-  TlsConfigObj {.acyclic.} = object
+  TlsConfig* {.acyclic.} = ref object
+    ## Server certificate and key, loaded once and shared by any number of
+    ## TLS listeners. Create with `newTlsConfig`. Requires `-d:ssl`.
     when defined(ssl):
       ctx: SslCtx
 
-  TlsConfig* = ref TlsConfigObj
-    ## Server certificate and key, loaded once and shared by any number of
-    ## TLS listeners. Create with `newTlsConfig`. Requires `-d:ssl`.
-
-  ListenerObj {.acyclic.} = object
+  Listener* {.acyclic.} = ref object
+    ## A bound and listening socket the server accepts connections from.
+    ## Returned by `addListener`, handed back to `removeListener`.
+    ## Acyclic, like the other refs that cross threads here (DataEntry,
+    ## OutgoingBuffer): a listener is created on the caller's thread and
+    ## released on the serving thread, and ORC's cycle-candidate roots are
+    ## per thread — a ref registered as a root on one thread and freed on
+    ## another crashes in unregisterCycle.
     id: int
     socket: SocketHandle
     address: string
     port: Port
     tls: TlsConfig
-
-  Listener* = ref ListenerObj
-    ## A bound and listening socket the server accepts connections from.
-    ## Returned by `addListener`, handed back to `removeListener`.
-    ## Acyclic, like the other refs that cross threads here: a listener is
-    ## created on the caller's thread and released on the serving thread,
-    ## and ORC's cycle-candidate roots are per thread.
 
   ListenerOp = object
     remove: bool
