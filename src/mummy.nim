@@ -104,7 +104,7 @@ type
     message: Message
   ) {.gcsafe.}
 
-  TlsConfigObj = object
+  TlsConfigObj {.acyclic.} = object
     when defined(ssl):
       ctx: SslCtx
 
@@ -112,7 +112,7 @@ type
     ## Server certificate and key, loaded once and shared by any number of
     ## TLS listeners. Create with `newTlsConfig`. Requires `-d:ssl`.
 
-  ListenerObj = object
+  ListenerObj {.acyclic.} = object
     id: int
     socket: SocketHandle
     address: string
@@ -122,6 +122,9 @@ type
   Listener* = ref ListenerObj
     ## A bound and listening socket the server accepts connections from.
     ## Returned by `addListener`, handed back to `removeListener`.
+    ## Acyclic, like the other refs that cross threads here: a listener is
+    ## created on the caller's thread and released on the serving thread,
+    ## and ORC's cycle-candidate roots are per thread.
 
   ListenerOp = object
     remove: bool
