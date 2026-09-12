@@ -1,4 +1,40 @@
-# Mummy
+# Mummy (FrameOS fork)
+
+This is [FrameOS](https://github.com/FrameOS/frameos)'s fork of
+[guzba/mummy](https://github.com/guzba/mummy). It adds what FrameOS needs to
+serve its on-device API over HTTPS without a separate proxy process:
+
+- **TLS listeners.** Compile with `-d:ssl` and pass a `TlsConfig` to
+  `addListener`; the handshake, reads and writes run inside the same epoll
+  loop as plain sockets (OpenSSL via Nim's `std/openssl`, no extra bindings).
+  The certificate chain and private key are loaded from memory with
+  `newTlsConfig(certificateChainPem, privateKeyPem)`, so the key never has to
+  be written to disk. TLS 1.2 is the minimum version.
+- **Several listeners per server**, plain and TLS side by side, added with
+  `addListener(port, address, tls)` and removed with `removeListener` — from
+  any thread, before or while serving. `serve()` with no arguments serves on
+  all of them; `serve(port, address)` still works as before.
+- **`Request.secure`**, true for requests that arrived over a TLS listener.
+
+Everything else is upstream mummy. Pin it by commit from a nimble file:
+`requires "https://github.com/FrameOS/mummy#<commit>"`.
+
+```nim
+import mummy
+
+proc handler(request: Request) =
+  request.respond(200, emptyHttpHeaders(), "secure: " & $request.secure)
+
+let server = newServer(handler)
+discard server.addListener(Port(8080), "0.0.0.0")
+let tls = newTlsConfig(readFile("cert.pem"), readFile("key.pem"))
+discard server.addListener(Port(8443), "0.0.0.0", tls)
+server.serve()
+```
+
+`nim c --threads:on --mm:orc -d:ssl -r tls_server.nim`
+
+---
 
 `nimble install mummy`
 
@@ -224,5 +260,7 @@ Requests/sec:   8,544.60
 Requests/sec:   9,171.55
 
 ## Testing
+
+The TLS listeners are covered by `nim c -r -d:ssl tests/test_tls.nim` (plain and TLS side by side, `Request.secure`, a multi-megabyte response, WebSocket over TLS, a client stalled mid-handshake, listeners added and removed while serving).
 
 A fuzzer has been run against Mummy's socket reading and parsing code to ensure Mummy does not crash or otherwise misbehave on bad data from sockets. You can run the fuzzer any time by running `nim c -r tests/fuzz_recv.nim`.

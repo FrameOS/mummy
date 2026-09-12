@@ -30,6 +30,26 @@ elif defined(posix):
 
 import std/locks
 
+when defined(ssl):
+  # TLS listeners terminate connections with OpenSSL inside the same epoll
+  # loop that serves plain sockets. Nim's stdlib wrapper already binds the
+  # whole server side (TLS_server_method, SSL_accept/read/write/pending,
+  # SSL_get_error, SSL_CTX_set_mode); the handful of symbols it lacks are
+  # declared below, linked the same way the wrapper links everything else.
+  import std/openssl
+
+  proc PEM_read_bio_X509(
+    bp: BIO, x: ptr PX509, cb: pointer, u: pointer
+  ): PX509 {.cdecl, importc.}
+  proc SSL_CTX_use_certificate(ctx: SslCtx, x: PX509): cint {.cdecl, importc.}
+  proc SSL_CTX_use_PrivateKey(ctx: SslCtx, pkey: EVP_PKEY): cint {.cdecl, importc.}
+  proc SSL_get_version(ssl: SslPtr): cstring {.cdecl, importc.}
+  proc mummyX509Free(cert: PX509) {.cdecl, importc: "X509_free".}
+
+  const
+    SSL_CTRL_SET_MIN_PROTO_VERSION = 123
+    TLS1_2_VERSION = 0x0303
+
 export Port, common, httpheaders, queryparams
 
 const
@@ -53,6 +73,7 @@ type
     headers*: HttpHeaders ## HTTP headers key-value pairs.
     body*: string ## Request body.
     remoteAddress*: string ## Network address of the request sender.
+    secure*: bool ## True when the request arrived over a TLS listener.
     server: Server
     clientSocket: SocketHandle
     clientId: uint64
@@ -83,6 +104,30 @@ type
     message: Message
   ) {.gcsafe.}
 
+  TlsConfigObj = object
+    when defined(ssl):
+      ctx: SslCtx
+
+  TlsConfig* = ref TlsConfigObj
+    ## Server certificate and key, loaded once and shared by any number of
+    ## TLS listeners. Create with `newTlsConfig`. Requires `-d:ssl`.
+
+  ListenerObj = object
+    id: int
+    socket: SocketHandle
+    address: string
+    port: Port
+    tls: TlsConfig
+
+  Listener* = ref ListenerObj
+    ## A bound and listening socket the server accepts connections from.
+    ## Returned by `addListener`, handed back to `removeListener`.
+
+  ListenerOp = object
+    remove: bool
+    listener: Listener # add
+    id: int # remove
+
   ServerObj = object
     handler: RequestHandler
     websocketHandler: WebSocketHandler
@@ -93,7 +138,11 @@ type
     workerThreads: seq[Thread[Server]]
     serving: Atomic[bool]
     destroyCalled: bool
-    socket: SocketHandle
+    listeners: seq[Listener] # Only touched by the serving thread
+    listenerOps: Deque[ListenerOp]
+    listenerOpsLock: Lock
+    nextListenerId: int # Under listenerOpsLock
+    listenersChanged: SelectEvent
     selector: Selector[DataEntry]
     responseQueued, sendQueued, shutdown: SelectEvent
     clientSockets: HashSet[SocketHandle]
@@ -120,12 +169,20 @@ type
   DataEntry {.acyclic.} = ref object
     case kind: DataEntryKind:
     of ServerSocketEntry:
-      discard
+      listener: Listener
     of EventEntry:
       event: SelectEvent
     of ClientSocketEntry:
       clientId: uint64
       remoteAddress: string
+      secure: bool # Accepted from a TLS listener
+      acceptedAt: float64
+      when defined(ssl):
+        ssl: SslPtr # nil on plain connections
+        tlsHandshaken: bool
+        # SSL_accept or SSL_read asked for the socket to become writable
+        # before it can make progress; keep Write armed until it has.
+        tlsWantWrite: bool
       recvBuf: string
       bytesReceived: int
       requestState: IncomingRequestState
@@ -258,6 +315,198 @@ proc setNoDelay(
       ErrorLevel,
       "Error setting TCP_NODELAY: ", e.msg
     )
+
+when defined(ssl):
+  proc tlsErrorText(): string =
+    let code = ERR_get_error()
+    if code == 0:
+      return "unknown OpenSSL error"
+    var buf: array[256, char]
+    discard ERR_error_string(code, cast[cstring](buf[0].addr))
+    result = $cast[cstring](buf[0].addr)
+    # Drain what is left so the next error is not misattributed
+    while ERR_get_error() != 0:
+      discard
+
+  proc newTlsConfig*(
+    certificateChainPem: string,
+    privateKeyPem: string
+  ): TlsConfig {.raises: [MummyError].} =
+    ## Loads a PEM certificate chain (leaf first) and its PEM private key from
+    ## memory, so the key never has to touch the file system. TLS 1.2 is the
+    ## minimum protocol version; ciphers are OpenSSL's defaults.
+    ## The returned config can back any number of TLS listeners and lives for
+    ## the rest of the process.
+    if certificateChainPem.len == 0 or privateKeyPem.len == 0:
+      raise newException(MummyError, "TLS certificate and key must not be empty")
+
+    let serverMethod =
+      try:
+        TLS_server_method()
+      except LibraryError as e:
+        raise newException(MummyError, "OpenSSL is not available: " & e.msg)
+    let ctx = SSL_CTX_new(serverMethod)
+    if ctx == nil:
+      raise newException(MummyError, "SSL_CTX_new failed: " & tlsErrorText())
+
+    proc fail(ctx: SslCtx, msg: string) {.raises: [MummyError].} =
+      SSL_CTX_free(ctx)
+      raise newException(MummyError, msg)
+
+    if SSL_CTX_ctrl(
+      ctx, SSL_CTRL_SET_MIN_PROTO_VERSION.cint, TLS1_2_VERSION.clong, nil
+    ) != 1:
+      fail(ctx, "Setting the minimum TLS version failed: " & tlsErrorText())
+
+    # Partial writes let the loop keep its plain-socket bookkeeping (bytesSent
+    # advances by whatever went out); the moving-buffer mode is needed because
+    # outgoing buffers are strings whose address may change between retries.
+    discard SSLCTXSetMode(
+      ctx, SSL_MODE_ENABLE_PARTIAL_WRITE or SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER
+    )
+
+    # Certificate chain: the first PEM block is the leaf, the rest are
+    # intermediates handed to the context as extra chain certificates.
+    let certBio = BIO_new_mem_buf(certificateChainPem[0].unsafeAddr, certificateChainPem.len.cint)
+    if certBio == nil:
+      fail(ctx, "BIO_new_mem_buf failed")
+    var certCount = 0
+    while true:
+      let cert = PEM_read_bio_X509(certBio, nil, nil, nil)
+      if cert == nil:
+        # The end of the PEM input also reports as an error; only a missing
+        # leaf is a real failure.
+        while ERR_get_error() != 0:
+          discard
+        break
+      if certCount == 0:
+        if SSL_CTX_use_certificate(ctx, cert) != 1:
+          mummyX509Free(cert)
+          discard BIO_free(certBio)
+          fail(ctx, "SSL_CTX_use_certificate failed: " & tlsErrorText())
+        mummyX509Free(cert) # The context holds its own reference
+      else:
+        # SSL_CTRL_EXTRA_CHAIN_CERT takes ownership of the certificate
+        if SSL_CTX_ctrl(ctx, SSL_CTRL_EXTRA_CHAIN_CERT.cint, 0, cert) != 1:
+          mummyX509Free(cert)
+          discard BIO_free(certBio)
+          fail(ctx, "Adding an intermediate certificate failed: " & tlsErrorText())
+      inc certCount
+    discard BIO_free(certBio)
+    if certCount == 0:
+      fail(ctx, "No certificate found in the PEM certificate chain")
+
+    let keyBio = BIO_new_mem_buf(privateKeyPem[0].unsafeAddr, privateKeyPem.len.cint)
+    if keyBio == nil:
+      fail(ctx, "BIO_new_mem_buf failed")
+    let key = PEM_read_bio_PrivateKey(keyBio, nil, nil, nil)
+    discard BIO_free(keyBio)
+    if key == nil:
+      fail(ctx, "Reading the PEM private key failed: " & tlsErrorText())
+    if SSL_CTX_use_PrivateKey(ctx, key) != 1:
+      EVP_PKEY_free(key)
+      fail(ctx, "SSL_CTX_use_PrivateKey failed: " & tlsErrorText())
+    EVP_PKEY_free(key) # The context holds its own reference
+
+    if SSL_CTX_check_private_key(ctx) != 1:
+      fail(ctx, "The private key does not match the certificate: " & tlsErrorText())
+
+    result = TlsConfig()
+    result.ctx = ctx
+
+proc port*(listener: Listener): Port =
+  ## The port the listener is bound to. Useful after `addListener` with
+  ## port 0, where the operating system picked the port.
+  listener.port
+
+proc address*(listener: Listener): string =
+  ## The address the listener is bound to.
+  listener.address
+
+proc secure*(listener: Listener): bool =
+  ## Whether connections accepted by this listener are TLS.
+  listener.tls != nil
+
+proc closeListenerSocket(listener: Listener) =
+  if listener.socket.int != 0:
+    listener.socket.close()
+    listener.socket = SocketHandle(0)
+
+proc addListener*(
+  server: Server,
+  port: Port,
+  address = "localhost",
+  tls: TlsConfig = nil
+): Listener {.raises: [MummyError].} =
+  ## Binds a listening socket and hands it to the server. Can be called
+  ## before `serve()` and, from any thread, while the server is serving —
+  ## the serving thread starts accepting from it on its next loop iteration.
+  ## Pass a `TlsConfig` to terminate TLS on this listener (requires `-d:ssl`).
+  ## Port 0 lets the operating system choose; read it back with `listener.port`.
+  ## Raises if the socket cannot be bound, without touching the server.
+  when not defined(ssl):
+    if tls != nil:
+      raise newException(MummyError, "TLS listeners require compiling with -d:ssl")
+
+  let listener = Listener()
+  listener.address = address
+  listener.port = port
+  listener.tls = tls
+  try:
+    listener.socket = createNativeSocket(
+      Domain.AF_INET,
+      SockType.SOCK_STREAM,
+      Protocol.IPPROTO_TCP,
+      false
+    )
+    if listener.socket == osInvalidSocket:
+      raiseOSError(osLastError())
+
+    listener.socket.setBlocking(false)
+    listener.socket.setSockOptInt(SOL_SOCKET, SO_REUSEADDR, 1)
+
+    let ai = getAddrInfo(
+      address,
+      port,
+      Domain.AF_INET,
+      SockType.SOCK_STREAM,
+      Protocol.IPPROTO_TCP,
+    )
+    try:
+      if bindAddr(listener.socket, ai.ai_addr, ai.ai_addrlen.SockLen) < 0:
+        raiseOSError(osLastError())
+    finally:
+      freeAddrInfo(ai)
+
+    if nativesockets.listen(listener.socket, listenBacklogLen) < 0:
+      raiseOSError(osLastError())
+
+    if port == Port(0):
+      let (_, boundPort) = getLocalAddr(listener.socket, Domain.AF_INET)
+      listener.port = boundPort
+  except Exception as e:
+    listener.closeListenerSocket()
+    raise currentExceptionAsMummyError()
+
+  withLock server.listenerOpsLock:
+    inc server.nextListenerId
+    listener.id = server.nextListenerId
+    server.listenerOps.addLast(ListenerOp(listener: listener))
+
+  if server.serving.load(moRelaxed):
+    server.trigger(server.listenersChanged)
+
+  listener
+
+proc removeListener*(server: Server, listener: Listener) {.raises: [].} =
+  ## Stops accepting on the listener and closes its socket. Connections it
+  ## already accepted are unaffected. Safe to call from any thread.
+  if listener == nil:
+    return
+  withLock server.listenerOpsLock:
+    server.listenerOps.addLast(ListenerOp(remove: true, id: listener.id))
+  if server.serving.load(moRelaxed):
+    server.trigger(server.listenersChanged)
 
 proc send*(
   websocket: WebSocket,
@@ -762,6 +1011,7 @@ proc popRequest(
   result.clientSocket = clientSocket
   result.clientId = dataEntry.clientId
   result.remoteAddress = dataEntry.remoteAddress
+  result.secure = dataEntry.secure
   result.httpVersion = dataEntry.requestState.httpVersion
   result.httpMethod = move dataEntry.requestState.httpMethod
   result.uri = move dataEntry.requestState.uri
@@ -1106,18 +1356,42 @@ proc afterSend(
       return true
   # If we don't have any more outgoing buffers, update the selector
   if dataEntry.outgoingBuffers.len == 0:
-    server.selector.updateHandle2(clientSocket, {Read})
+    var keepWrite = false
+    when defined(ssl):
+      # A TLS read or handshake step may still be waiting for writability
+      keepWrite = dataEntry.tlsWantWrite
+    if not keepWrite:
+      server.selector.updateHandle2(clientSocket, {Read})
 
 proc destroy(server: Server, joinThreads: bool) {.raises: [].} =
   withLock server.taskQueueLock:
     server.destroyCalled = true
+  when defined(ssl):
+    # Free the per-connection SSL objects while the selector can still map
+    # a socket to its entry.
+    if server.selector != nil:
+      for clientSocket in server.clientSockets:
+        try:
+          let dataEntry = server.selector.getData(clientSocket)
+          if dataEntry != nil and dataEntry.kind == ClientSocketEntry and
+            dataEntry.ssl != nil:
+            SSL_free(dataEntry.ssl)
+            dataEntry.ssl = nil
+        except Exception as e:
+          discard # Ignore
   if server.selector != nil:
     try:
       server.selector.close()
     except Exception as e:
       discard # Ignore
-  if server.socket.int != 0:
-    server.socket.close()
+  for listener in server.listeners:
+    listener.closeListenerSocket()
+  server.listeners.setLen(0)
+  withLock server.listenerOpsLock:
+    while server.listenerOps.len > 0:
+      let op = server.listenerOps.popFirst()
+      if not op.remove:
+        op.listener.closeListenerSocket()
   for clientSocket in server.clientSockets:
     clientSocket.close()
   broadcast(server.taskQueueCond)
@@ -1128,6 +1402,11 @@ proc destroy(server: Server, joinThreads: bool) {.raises: [].} =
     deinitLock(server.responseQueueLock)
     deinitLock(server.sendQueueLock)
     deinitLock(server.websocketQueuesLock)
+    deinitLock(server.listenerOpsLock)
+    try:
+      server.listenersChanged.close()
+    except Exception as e:
+      discard # Ignore
     try:
       server.responseQueued.close()
     except Exception as e:
@@ -1147,6 +1426,110 @@ proc destroy(server: Server, joinThreads: bool) {.raises: [].} =
     # The process is likely going to be exiting anyway
     discard
 
+when defined(ssl):
+  proc tlsStep(
+    server: Server,
+    clientSocket: SocketHandle,
+    dataEntry: DataEntry
+  ): tuple[received, sent, close: bool] {.raises: [IOSelectorsException].} =
+    ## One step of a TLS connection, run on any Read or Write readiness:
+    ## finishes the handshake, drains every record OpenSSL has buffered into
+    ## recvBuf (one epoll wake-up can carry several), and pushes as much of
+    ## the head outgoing buffer as SSL_write accepts. Ends by arming the
+    ## selector with what OpenSSL says it needs next.
+    dataEntry.tlsWantWrite = false
+    var writeWantsRead = false
+
+    if not dataEntry.tlsHandshaken:
+      let ret = SSL_accept(dataEntry.ssl)
+      if ret == 1:
+        dataEntry.tlsHandshaken = true
+        server.log(
+          DebugLevel,
+          "TLS handshake ", $SSL_get_version(dataEntry.ssl), " ",
+          $int((epochTime() - dataEntry.acceptedAt) * 1000), " ms ",
+          dataEntry.remoteAddress
+        )
+      else:
+        case SSL_get_error(dataEntry.ssl, ret):
+        of SSL_ERROR_WANT_READ:
+          server.selector.updateHandle2(clientSocket, {Read})
+          return
+        of SSL_ERROR_WANT_WRITE:
+          dataEntry.tlsWantWrite = true
+          server.selector.updateHandle2(clientSocket, {Read, Write})
+          return
+        else:
+          server.log(DebugLevel, "TLS handshake failed: ", tlsErrorText())
+          return (false, false, true)
+
+    # Read everything OpenSSL can give us
+    while true:
+      # Expand the buffer if it is full
+      if dataEntry.bytesReceived == dataEntry.recvBuf.len:
+        dataEntry.recvBuf.setLen(dataEntry.recvBuf.len * 2)
+      let ret = SSL_read(
+        dataEntry.ssl,
+        dataEntry.recvBuf[dataEntry.bytesReceived].addr,
+        dataEntry.recvBuf.len - dataEntry.bytesReceived
+      )
+      if ret > 0:
+        dataEntry.bytesReceived += ret
+        result.received = true
+        continue
+      case SSL_get_error(dataEntry.ssl, ret):
+      of SSL_ERROR_WANT_READ:
+        discard
+      of SSL_ERROR_WANT_WRITE:
+        dataEntry.tlsWantWrite = true
+      else:
+        # close_notify (ZERO_RETURN), the peer going away (SYSCALL) or a
+        # protocol error (SSL). Data read just before it is still handed
+        # to the parser; the close follows on the next wake-up.
+        if not result.received:
+          return (false, result.sent, true)
+        while ERR_get_error() != 0:
+          discard
+      break
+
+    # Write the head of the outgoing queue
+    if dataEntry.outgoingBuffers.len > 0:
+      let
+        outgoingBuffer = dataEntry.outgoingBuffers.peekFirst()
+        totalBytes = outgoingBuffer.buffer1.len + outgoingBuffer.buffer2.len
+      if outgoingBuffer.bytesSent < totalBytes:
+        let ret =
+          if outgoingBuffer.bytesSent < outgoingBuffer.buffer1.len:
+            SSL_write(
+              dataEntry.ssl,
+              cast[cstring](outgoingBuffer.buffer1[outgoingBuffer.bytesSent].addr),
+              outgoingBuffer.buffer1.len - outgoingBuffer.bytesSent
+            )
+          else:
+            let buffer2Pos = outgoingBuffer.bytesSent - outgoingBuffer.buffer1.len
+            SSL_write(
+              dataEntry.ssl,
+              cast[cstring](outgoingBuffer.buffer2[buffer2Pos].addr),
+              outgoingBuffer.buffer2.len - buffer2Pos
+            )
+        if ret > 0:
+          outgoingBuffer.bytesSent += ret
+          result.sent = true
+        else:
+          case SSL_get_error(dataEntry.ssl, ret):
+          of SSL_ERROR_WANT_WRITE:
+            discard # Socket buffer full, Write stays armed below
+          of SSL_ERROR_WANT_READ:
+            writeWantsRead = true
+          else:
+            return (result.received, false, true)
+
+    var events = {Read}
+    if dataEntry.tlsWantWrite or
+      (dataEntry.outgoingBuffers.len > 0 and not writeWantsRead):
+      events.incl(Write)
+    server.selector.updateHandle2(clientSocket, events)
+
 proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
   var
     readyKeys: array[maxEventsPerSelectLoop, ReadyKey]
@@ -1154,6 +1537,7 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
     needClosing: HashSet[SocketHandle]
     encodedResponses: seq[OutgoingBuffer]
     encodedFrames: seq[OutgoingBuffer]
+    listenerOps: seq[ListenerOp]
   while true:
     receivedFrom.setLen(0)
     sentTo.setLen(0)
@@ -1164,7 +1548,9 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
     let readyCount = server.selector.selectInto(-1, readyKeys)
 
     # Collapse these events into simple flags
-    var responseQueuedTriggered, sendQueuedTriggered, shutdownTriggered: bool
+    var
+      responseQueuedTriggered, sendQueuedTriggered, shutdownTriggered: bool
+      listenersChangedTriggered: bool
     for i in 0 ..< readyCount:
       let readyKey = readyKeys[i]
       if User in readyKey.events:
@@ -1175,8 +1561,24 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
           sendQueuedTriggered = true
         elif eventDataEntry.event == server.shutdown:
           shutdownTriggered = true
+        elif eventDataEntry.event == server.listenersChanged:
+          listenersChangedTriggered = true
         else:
           discard
+
+    if shutdownTriggered:
+      server.destroy(true)
+      return
+
+    if listenersChangedTriggered:
+      # Listeners added or removed from other threads (or before serving)
+      # are applied here so the selector is only ever touched by this thread.
+      # A removed listener's socket stays registered until the ready keys of
+      # this iteration have been handled: closing it earlier would let the
+      # kernel hand its descriptor number to a client accepted below.
+      withLock server.listenerOpsLock:
+        while server.listenerOps.len > 0:
+          listenerOps.add(server.listenerOps.popFirst())
 
     if responseQueuedTriggered:
       # If we have responses queued move them to the outgoing buffer queue of
@@ -1261,19 +1663,30 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
         else:
           server.log(DebugLevel, "Dropped message to disconnected client")
 
-    if shutdownTriggered:
-      server.destroy(true)
-      return
-
     # This is the main client socket select loop
     for i in 0 ..< readyCount:
       let readyKey = readyKeys[i]
 
       # echo "Socket ready: ", readyKey.fd, " ", readyKey.events
 
-      if readyKey.fd == server.socket.int:
+      if User in readyKey.events:
+        continue # Handled above
+
+      let dataEntry =
+        try:
+          server.selector.getData(readyKey.fd)
+        except Exception as e:
+          nil # Unregistered earlier in this iteration (a removed listener)
+      if dataEntry == nil:
+        continue
+
+      case dataEntry.kind:
+      of EventEntry:
+        discard
+      of ServerSocketEntry:
         # We should have a new client socket to accept
         if Read in readyKey.events:
+          let listener = dataEntry.listener
           let (clientSocket, remoteAddress) =
             when defined(linux) and not defined(nimdoc):
               var
@@ -1282,7 +1695,7 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
               let
                 socket =
                   accept4(
-                    server.socket,
+                    listener.socket,
                     sockAddr.addr,
                     addrLen.addr,
                     SOCK_CLOEXEC or SOCK_NONBLOCK
@@ -1294,7 +1707,7 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
                     ""
               (socket, sockAddrStr)
             else:
-              server.socket.accept()
+              listener.socket.accept()
 
           if clientSocket == osInvalidSocket:
             continue
@@ -1306,19 +1719,50 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
           if server.tcpNoDelay:
             server.setNoDelay(clientSocket)
 
-          server.clientSockets.incl(clientSocket)
+          let clientDataEntry = DataEntry(kind: ClientSocketEntry)
+          clientDataEntry.clientId = server.rand.next()
+          clientDataEntry.remoteAddress = remoteAddress
+          clientDataEntry.acceptedAt = epochTime()
+          clientDataEntry.recvBuf.setLen(initialRecvBufLen)
 
-          let dataEntry = DataEntry(kind: ClientSocketEntry)
-          dataEntry.clientId = server.rand.next()
-          dataEntry.remoteAddress = remoteAddress
-          dataEntry.recvBuf.setLen(initialRecvBufLen)
-          server.selector.registerHandle2(clientSocket, {Read}, dataEntry)
-      else: # Client socket
+          if listener.tls != nil:
+            when defined(ssl):
+              let ssl = SSL_new(listener.tls.ctx)
+              if ssl == nil or SSL_set_fd(ssl, clientSocket) != 1:
+                server.log(ErrorLevel, "SSL_new failed: ", tlsErrorText())
+                if ssl != nil:
+                  SSL_free(ssl)
+                clientSocket.close()
+                continue
+              clientDataEntry.ssl = ssl
+              clientDataEntry.secure = true
+            else:
+              clientSocket.close()
+              continue
+
+          server.clientSockets.incl(clientSocket)
+          server.selector.registerHandle2(clientSocket, {Read}, clientDataEntry)
+      of ClientSocketEntry:
         if Error in readyKey.events:
           needClosing.incl(readyKey.fd.SocketHandle)
           continue
 
-        let dataEntry = server.selector.getData(readyKey.fd)
+        var isTls = false
+        when defined(ssl):
+          isTls = dataEntry.ssl != nil
+
+        if isTls:
+          when defined(ssl):
+            let (received, sent, close) =
+              server.tlsStep(readyKey.fd.SocketHandle, dataEntry)
+            if close:
+              needClosing.incl(readyKey.fd.SocketHandle)
+              continue
+            if received:
+              receivedFrom.add(readyKey.fd.SocketHandle)
+            if sent:
+              sentTo.add(readyKey.fd.SocketHandle)
+          continue
 
         if Read in readyKey.events:
           # Expand the buffer if it is full
@@ -1388,6 +1832,14 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
         # Leaks DataEntry for this socket
         server.log(DebugLevel, "Error unregistering client socket")
       finally:
+        when defined(ssl):
+          if dataEntry.ssl != nil:
+            # Best effort close_notify; the socket is nonblocking so one
+            # call is all the peer gets.
+            if dataEntry.tlsHandshaken:
+              discard SSL_shutdown(dataEntry.ssl)
+            SSL_free(dataEntry.ssl)
+            dataEntry.ssl = nil
         clientSocket.close()
         server.clientSockets.excl(clientSocket)
       if dataEntry.upgradedToWebSocket:
@@ -1402,14 +1854,63 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
         var close = WebSocketUpdate(event: CloseEvent)
         websocket.postWebSocketUpdate(close)
 
+    # Apply listener changes last, see the note above
+    for op in listenerOps:
+      if op.remove:
+        for i in 0 ..< server.listeners.len:
+          let listener = server.listeners[i]
+          if listener.id == op.id:
+            try:
+              server.selector.unregister(listener.socket)
+            except Exception as e:
+              server.log(DebugLevel, "Error unregistering listener socket")
+            listener.closeListenerSocket()
+            server.listeners.delete(i)
+            break
+      else:
+        let dataEntry = DataEntry(kind: ServerSocketEntry)
+        dataEntry.listener = op.listener
+        server.selector.registerHandle2(op.listener.socket, {Read}, dataEntry)
+        server.listeners.add(op.listener)
+    listenerOps.setLen(0)
+
 proc close*(server: Server) {.raises: [], gcsafe.} =
   ## Cleanly stops and deallocates the server.
   ## In-flight request handler calls will be allowed to finish.
   ## No additional handler calls will be dispatched even if they are queued.
-  if server.socket.int != 0:
+  if server.serving.load(moRelaxed):
     server.trigger(server.shutdown)
   else:
     server.destroy(true)
+
+proc serve*(server: Server) {.raises: [MummyError].} =
+  ## Serves on every listener added with `addListener`, and on any added
+  ## later while serving. At least one listener must have been added.
+  ## This call does not return unless server.close() is called from another
+  ## thread.
+  if server.serving.load(moRelaxed):
+    raise newException(MummyError, "Server is already serving")
+
+  var hasListener: bool
+  withLock server.listenerOpsLock:
+    for op in server.listenerOps:
+      if not op.remove:
+        hasListener = true
+        break
+  if not hasListener:
+    server.destroy(true)
+    raise newException(MummyError, "Server has no listeners, call addListener first")
+
+  server.serving.store(true, moRelaxed)
+  # Pending listeners are registered by the first loop iteration
+  server.trigger(server.listenersChanged)
+
+  try:
+    server.loopForever()
+  except Exception as e:
+    server.log(ErrorLevel, e.msg & "\n" & e.getStackTrace())
+    server.destroy(false)
+    raise currentExceptionAsMummyError()
 
 proc serve*(
   server: Server,
@@ -1421,53 +1922,12 @@ proc serve*(
   ## caution).
   ## This call does not return unless server.close() is called from another
   ## thread.
-
-  if server.socket.int != 0:
-    raise newException(MummyError, "Server already has a socket")
-
   try:
-    server.socket = createNativeSocket(
-      Domain.AF_INET,
-      SockType.SOCK_STREAM,
-      Protocol.IPPROTO_TCP,
-      false
-    )
-    if server.socket == osInvalidSocket:
-      raiseOSError(osLastError())
-
-    server.socket.setBlocking(false)
-    server.socket.setSockOptInt(SOL_SOCKET, SO_REUSEADDR, 1)
-
-    let ai = getAddrInfo(
-      address,
-      port,
-      Domain.AF_INET,
-      SockType.SOCK_STREAM,
-      Protocol.IPPROTO_TCP,
-    )
-    try:
-      if bindAddr(server.socket, ai.ai_addr, ai.ai_addrlen.SockLen) < 0:
-        raiseOSError(osLastError())
-    finally:
-      freeAddrInfo(ai)
-
-    if nativesockets.listen(server.socket, listenBacklogLen) < 0:
-      raiseOSError(osLastError())
-
-    let dataEntry = DataEntry(kind: ServerSocketEntry)
-    server.selector.registerHandle2(server.socket, {Read}, dataEntry)
-  except Exception as e:
+    discard server.addListener(port, address)
+  except MummyError as e:
     server.destroy(true)
-    raise currentExceptionAsMummyError()
-
-  server.serving.store(true, moRelaxed)
-
-  try:
-    server.loopForever()
-  except Exception as e:
-    server.log(ErrorLevel, e.msg & "\n" & e.getStackTrace())
-    server.destroy(false)
-    raise currentExceptionAsMummyError()
+    raise e
+  server.serve()
 
 proc newServer*(
   handler: RequestHandler,
@@ -1510,12 +1970,17 @@ proc newServer*(
     result.responseQueued = newSelectEvent()
     result.sendQueued = newSelectEvent()
     result.shutdown = newSelectEvent()
+    result.listenersChanged = newSelectEvent()
 
     result.selector = newSelector[DataEntry]()
 
     let responseQueuedData = DataEntry(kind: EventEntry)
     responseQueuedData.event = result.responseQueued
     result.selector.registerEvent(result.responseQueued, responseQueuedData)
+
+    let listenersChangedData = DataEntry(kind: EventEntry)
+    listenersChangedData.event = result.listenersChanged
+    result.selector.registerEvent(result.listenersChanged, listenersChangedData)
 
     let sendQueuedData = DataEntry(kind: EventEntry)
     sendQueuedData.event = result.sendQueued
@@ -1530,6 +1995,7 @@ proc newServer*(
     initLock(result.responseQueueLock)
     initLock(result.sendQueueLock)
     initLock(result.websocketQueuesLock)
+    initLock(result.listenerOpsLock)
 
     for i in 0 ..< workerThreads:
       createThread(result.workerThreads[i], workerProc, result)

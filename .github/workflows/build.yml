@@ -25,4 +25,8 @@ jobs:
       if: ${{ matrix.atomic_arc }}
     - run: nim c -r -d:useMalloc tests/test_http2.nim
     - run: nim c -r -d:useMalloc tests/test_websockets.nim
+    - run: nim c -r -d:useMalloc -d:ssl tests/test_http.nim
+      if: ${{ runner.os == 'Linux' }}
+    - run: nim c -r -d:useMalloc -d:ssl tests/test_tls.nim
+      if: ${{ runner.os == 'Linux' }}
     - run: nim c -r -d:useMalloc -d:mummyNoWorkers tests/fuzz_recv.nim
