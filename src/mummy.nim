@@ -35,16 +35,22 @@ when defined(ssl):
   # loop that serves plain sockets. Nim's stdlib wrapper already binds the
   # whole server side (TLS_server_method, SSL_accept/read/write/pending,
   # SSL_get_error, SSL_CTX_set_mode); the handful of symbols it lacks are
-  # declared below, linked the same way the wrapper links everything else.
+  # declared below, bound the way the wrapper binds everything else: through
+  # its DLLSSLName / DLLUtilName library patterns (stock Nim loads OpenSSL
+  # at run time; a Nim built to link -lssl still resolves these).
   import std/openssl
 
   proc PEM_read_bio_X509(
     bp: BIO, x: ptr PX509, cb: pointer, u: pointer
-  ): PX509 {.cdecl, importc.}
-  proc SSL_CTX_use_certificate(ctx: SslCtx, x: PX509): cint {.cdecl, importc.}
-  proc SSL_CTX_use_PrivateKey(ctx: SslCtx, pkey: EVP_PKEY): cint {.cdecl, importc.}
-  proc SSL_get_version(ssl: SslPtr): cstring {.cdecl, importc.}
-  proc mummyX509Free(cert: PX509) {.cdecl, importc: "X509_free".}
+  ): PX509 {.cdecl, dynlib: DLLUtilName, importc.}
+  proc SSL_CTX_use_certificate(
+    ctx: SslCtx, x: PX509
+  ): cint {.cdecl, dynlib: DLLSSLName, importc.}
+  proc SSL_CTX_use_PrivateKey(
+    ctx: SslCtx, pkey: EVP_PKEY
+  ): cint {.cdecl, dynlib: DLLSSLName, importc.}
+  proc SSL_get_version(ssl: SslPtr): cstring {.cdecl, dynlib: DLLSSLName, importc.}
+  proc mummyX509Free(cert: PX509) {.cdecl, dynlib: DLLUtilName, importc: "X509_free".}
 
   const
     SSL_CTRL_SET_MIN_PROTO_VERSION = 123
@@ -140,10 +146,9 @@ type
     serving: Atomic[bool]
     destroyCalled: bool
     listeners: seq[Listener] # Only touched by the serving thread
-    listenerOps: Deque[ListenerOp]
+    listenerOps: Deque[ListenerOp] # Applied by the serving thread on wake-up
     listenerOpsLock: Lock
     nextListenerId: int # Under listenerOpsLock
-    listenersChanged: SelectEvent
     selector: Selector[DataEntry]
     responseQueued, sendQueued, shutdown: SelectEvent
     clientSockets: HashSet[SocketHandle]
@@ -494,8 +499,11 @@ proc addListener*(
     listener.id = server.nextListenerId
     server.listenerOps.addLast(ListenerOp(listener: listener))
 
+  # Listener changes ride the responseQueued event: the loop drains the ops
+  # queue whenever it wakes up for a queued response, and a trigger with
+  # nothing queued costs one empty pass.
   if server.serving.load(moRelaxed):
-    server.trigger(server.listenersChanged)
+    server.trigger(server.responseQueued)
 
   listener
 
@@ -507,7 +515,7 @@ proc removeListener*(server: Server, listener: Listener) {.raises: [].} =
   withLock server.listenerOpsLock:
     server.listenerOps.addLast(ListenerOp(remove: true, id: listener.id))
   if server.serving.load(moRelaxed):
-    server.trigger(server.listenersChanged)
+    server.trigger(server.responseQueued)
 
 proc send*(
   websocket: WebSocket,
@@ -1405,10 +1413,6 @@ proc destroy(server: Server, joinThreads: bool) {.raises: [].} =
     deinitLock(server.websocketQueuesLock)
     deinitLock(server.listenerOpsLock)
     try:
-      server.listenersChanged.close()
-    except Exception as e:
-      discard # Ignore
-    try:
       server.responseQueued.close()
     except Exception as e:
       discard # Ignore
@@ -1549,9 +1553,7 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
     let readyCount = server.selector.selectInto(-1, readyKeys)
 
     # Collapse these events into simple flags
-    var
-      responseQueuedTriggered, sendQueuedTriggered, shutdownTriggered: bool
-      listenersChangedTriggered: bool
+    var responseQueuedTriggered, sendQueuedTriggered, shutdownTriggered: bool
     for i in 0 ..< readyCount:
       let readyKey = readyKeys[i]
       if User in readyKey.events:
@@ -1562,8 +1564,6 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
           sendQueuedTriggered = true
         elif eventDataEntry.event == server.shutdown:
           shutdownTriggered = true
-        elif eventDataEntry.event == server.listenersChanged:
-          listenersChangedTriggered = true
         else:
           discard
 
@@ -1571,17 +1571,17 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
       server.destroy(true)
       return
 
-    if listenersChangedTriggered:
+    if responseQueuedTriggered:
       # Listeners added or removed from other threads (or before serving)
-      # are applied here so the selector is only ever touched by this thread.
-      # A removed listener's socket stays registered until the ready keys of
-      # this iteration have been handled: closing it earlier would let the
-      # kernel hand its descriptor number to a client accepted below.
+      # share this wake-up; they are applied at the end of the iteration so
+      # the selector is only ever touched by this thread, and so a removed
+      # listener's socket stays registered until the ready keys of this
+      # iteration have been handled (closing it earlier would let the kernel
+      # hand its descriptor number to a client accepted below).
       withLock server.listenerOpsLock:
         while server.listenerOps.len > 0:
           listenerOps.add(server.listenerOps.popFirst())
 
-    if responseQueuedTriggered:
       # If we have responses queued move them to the outgoing buffer queue of
       # the appropriate socket and update the socket selector to include Write
 
@@ -1904,7 +1904,7 @@ proc serve*(server: Server) {.raises: [MummyError].} =
 
   server.serving.store(true, moRelaxed)
   # Pending listeners are registered by the first loop iteration
-  server.trigger(server.listenersChanged)
+  server.trigger(server.responseQueued)
 
   try:
     server.loopForever()
@@ -1966,22 +1966,26 @@ proc newServer*(
 
   result.workerThreads.setLen(workerThreads)
 
+  # The locks first: destroy() acquires taskQueueLock, so a failure below
+  # must not find them uninitialised.
+  initLock(result.taskQueueLock)
+  initCond(result.taskQueueCond)
+  initLock(result.responseQueueLock)
+  initLock(result.sendQueueLock)
+  initLock(result.websocketQueuesLock)
+  initLock(result.listenerOpsLock)
+
   # Stuff that can fail
   try:
     result.responseQueued = newSelectEvent()
     result.sendQueued = newSelectEvent()
     result.shutdown = newSelectEvent()
-    result.listenersChanged = newSelectEvent()
 
     result.selector = newSelector[DataEntry]()
 
     let responseQueuedData = DataEntry(kind: EventEntry)
     responseQueuedData.event = result.responseQueued
     result.selector.registerEvent(result.responseQueued, responseQueuedData)
-
-    let listenersChangedData = DataEntry(kind: EventEntry)
-    listenersChangedData.event = result.listenersChanged
-    result.selector.registerEvent(result.listenersChanged, listenersChangedData)
 
     let sendQueuedData = DataEntry(kind: EventEntry)
     sendQueuedData.event = result.sendQueued
@@ -1990,13 +1994,6 @@ proc newServer*(
     let shutdownData = DataEntry(kind: EventEntry)
     shutdownData.event = result.shutdown
     result.selector.registerEvent(result.shutdown, shutdownData)
-
-    initLock(result.taskQueueLock)
-    initCond(result.taskQueueCond)
-    initLock(result.responseQueueLock)
-    initLock(result.sendQueueLock)
-    initLock(result.websocketQueuesLock)
-    initLock(result.listenerOpsLock)
 
     for i in 0 ..< workerThreads:
       createThread(result.workerThreads[i], workerProc, result)
