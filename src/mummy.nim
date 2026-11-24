@@ -958,7 +958,7 @@ proc afterRecvWebSocket(
     if dataEntry.bytesReceived == frameLen:
       dataEntry.bytesReceived = 0
     else:
-      copyMem(
+      moveMem(
         dataEntry.recvBuf[0].addr,
         dataEntry.recvBuf[frameLen].addr,
         dataEntry.bytesReceived - frameLen
@@ -1218,7 +1218,7 @@ proc afterRecvHttp(
       # without having to copy the headers out
       # Preferring to copy the headers out to avoid the worst case of copying
       # huge bodies
-      copyMem(
+      moveMem(
         dataEntry.recvBuf[0].addr,
         dataEntry.recvBuf[bodyStart].addr,
         dataEntry.bytesReceived - bodyStart
@@ -1286,7 +1286,7 @@ proc afterRecvHttp(
       let
         nextChunkStart = chunkLenEnd + 2 + chunkLen + 2
         bytesRemaining = dataEntry.bytesReceived - nextChunkStart
-      copyMem(
+      moveMem(
         dataEntry.recvBuf[0].addr,
         dataEntry.recvBuf[nextChunkStart].addr,
         bytesRemaining
@@ -1325,7 +1325,7 @@ proc afterRecvHttp(
         # Remove this request from the receive buffer
         let bytesRemaining =
           dataEntry.bytesReceived - dataEntry.requestState.contentLength
-        copyMem(
+        moveMem(
           dataEntry.recvBuf[0].addr,
           dataEntry.recvBuf[dataEntry.requestState.contentLength].addr,
           bytesRemaining
